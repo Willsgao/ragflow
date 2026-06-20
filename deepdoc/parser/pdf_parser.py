@@ -49,6 +49,16 @@ from common import settings
 
 from common.misc_utils import thread_pool_exec
 
+# optional: docutable table extraction engine — silently degrades if unavailable
+try:
+    from deepdoc.parser.docutable.core import PDFExtractor as DocuTableExtractor
+    from deepdoc.parser.docutable.core import TableProcessor as DocuTableProcessor
+    from deepdoc.parser.docutable.core import ExcelExporter as DocuTableExporter
+except ImportError:
+    DocuTableExtractor = None
+    DocuTableProcessor = None
+    DocuTableExporter = None
+
 LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
 if LOCK_KEY_pdfplumber not in sys.modules:
     sys.modules[LOCK_KEY_pdfplumber] = threading.Lock()
