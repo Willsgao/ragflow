@@ -100,16 +100,20 @@ class RAGFlowPdfParser:
             self.layouter = LayoutRecognizer(recognizer_domain)
         self.tbl_det = TableStructureRecognizer()
 
-        self.updown_cnt_mdl = xgb.Booster()
-        # xgboost model is very small; using CPU explicitly
-        self.updown_cnt_mdl.set_param({"device": "cpu"})
-        logging.info("updown_cnt_mdl initialized on CPU")
         try:
-            model_dir = os.path.join(get_project_base_directory(), "rag/res/deepdoc")
-            self.updown_cnt_mdl.load_model(os.path.join(model_dir, "updown_concat_xgb.model"))
+            self.updown_cnt_mdl = xgb.Booster()
+            # xgboost model is very small; using CPU explicitly
+            self.updown_cnt_mdl.set_param({"device": "cpu"})
+            logging.info("updown_cnt_mdl initialized on CPU")
+            try:
+                model_dir = os.path.join(get_project_base_directory(), "rag/res/deepdoc")
+                self.updown_cnt_mdl.load_model(os.path.join(model_dir, "updown_concat_xgb.model"))
+            except Exception:
+                model_dir = snapshot_download(repo_id="InfiniFlow/text_concat_xgb_v1.0", local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"), local_dir_use_symlinks=False)
+                self.updown_cnt_mdl.load_model(os.path.join(model_dir, "updown_concat_xgb.model"))
         except Exception:
-            model_dir = snapshot_download(repo_id="InfiniFlow/text_concat_xgb_v1.0", local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"), local_dir_use_symlinks=False)
-            self.updown_cnt_mdl.load_model(os.path.join(model_dir, "updown_concat_xgb.model"))
+            logging.warning("updown_cnt_mdl failed to load; paragraph merge prediction will be disabled")
+            self.updown_cnt_mdl = None
 
         self.page_from = 0
         self.column_num = 1
@@ -1103,6 +1107,10 @@ class RAGFlowPdfParser:
                         i += 1
                         continue
 
+                    if self.updown_cnt_mdl is None:
+                        dfs(down, i + 1)
+                        i += 1
+                        continue
                     fea = self._updown_concat_features(up, down)
                     if self.updown_cnt_mdl.predict(xgb.DMatrix([fea]))[0] <= 0.5:
                         i += 1
@@ -1705,6 +1713,7 @@ class RAGFlowPdfParser:
         self._concat_downward()
         self._filter_forpages()
         tbls = self._extract_table_figure(need_image, zoomin, return_html, False)
+        self._try_docutable_extract(fnm, tbls)
         return self.__filterout_scraps(deepcopy(self.boxes), zoomin), tbls
 
     def parse_into_bboxes(self, fnm, callback=None, zoomin=3, from_page=0, to_page=MAXIMUM_PAGE_NUMBER):
@@ -1726,7 +1735,7 @@ class RAGFlowPdfParser:
 
         if effective_to_page - from_page <= batch_size:
             self.__images__(fnm, zoomin, page_from=from_page, page_to=effective_to_page, callback=callback)
-            return self._parse_loaded_window_into_bboxes(zoomin, callback=callback)
+            return self._parse_loaded_window_into_bboxes(zoomin, callback=callback, fnm=fnm)
 
         logging.info(
             "parse_into_bboxes uses chunk mode: from_page=%s, effective_to_page=%s, batch_size=%s",
@@ -1747,7 +1756,7 @@ class RAGFlowPdfParser:
         logging.info("parse_into_bboxes chunk mode cost %.2fs", timer() - start)
         return all_boxes
 
-    def _parse_loaded_window_into_bboxes(self, zoomin=3, callback=None):
+    def _parse_loaded_window_into_bboxes(self, zoomin=3, callback=None, fnm=None):
         start = timer()
         self._layouts_rec(zoomin)
         if callback:
@@ -1842,6 +1851,11 @@ class RAGFlowPdfParser:
 
         insert_table_figures(tbls, "table")
         insert_table_figures(figs, "figure")
+
+        # ---- docutable 补充表格提取 ----
+        if fnm is not None:
+            self._try_docutable_extract_into_boxes(fnm, zoomin)
+
         if callback:
             callback(1, "Structured ({:.2f}s)".format(timer() - start))
         return deepcopy(self.boxes)
@@ -2011,6 +2025,274 @@ class RAGFlowPdfParser:
             poss.append((pn, bx["x0"], bx["x1"], top, min(bott, self.page_images[pn - 1].size[1] / ZM)))
         return poss
 
+    @staticmethod
+    # ------------------------------------------------------------------
+    # docutable 共享工具方法
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _docutable_enabled():
+        """docutable 前置检查：模块是否导入、环境变量是否开启。"""
+        if DocuTableExtractor is None:
+            logging.warning("docutable: DocuTableExtractor is None (import failed)")
+            return False
+        if os.getenv("ENABLE_DOCUTABLE", "").lower() not in ("true", "1", "yes"):
+            return False
+        return True
+
+    @staticmethod
+    def _docutable_prepare_input(fnm):
+        """准备 docutable 的 PDF 输入。
+
+        Returns:
+            (pdf_path, temp_path | None): pdf_path 是可被 pdfplumber/fitz 打开的有效路径；
+            temp_path 非 None 时表示创建了临时文件，调用者负责清理。
+            输入无效时返回 (None, None)。
+        """
+        import tempfile
+
+        if isinstance(fnm, (bytes, bytearray)):
+            fd, temp_path = tempfile.mkstemp(suffix=".pdf")
+            try:
+                os.write(fd, fnm)
+                os.close(fd)
+                return temp_path, temp_path
+            except Exception:
+                if os.path.isfile(temp_path):
+                    os.unlink(temp_path)
+                raise
+
+        if isinstance(fnm, str) and os.path.isfile(fnm):
+            return fnm, None
+
+        logging.warning("docutable: skip — fnm type=%s, isfile=%s",
+                        type(fnm).__name__,
+                        os.path.isfile(fnm) if isinstance(fnm, str) else "N/A")
+        return None, None
+
+    @staticmethod
+    def _build_table_text(tbl_data):
+        """将二维表格数据转为 pipe 分隔的文本。"""
+        return "\n".join(
+            " | ".join(str(c) if c else "" for c in row) for row in tbl_data
+        )
+
+    @staticmethod
+    def _parse_result_bbox(r):
+        """从 docutable 提取结果中获取 bbox，无则回退为 [0,0,1000,1000]。"""
+        bbox = r.get("bbox")
+        if bbox and len(bbox) == 4:
+            return bbox[0], bbox[1], bbox[2], bbox[3]
+        return 0, 0, 1000, 1000
+
+    @staticmethod
+    def _docutable_cleanup_temp(temp_path):
+        """清理临时文件。"""
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------------
+    # docutable 表格提取入口
+    # ------------------------------------------------------------------
+
+    def _tbls_existing_regions(tbls, page):
+        """收集 tbls 中已有表格的 bbox 区域（用于去重）。"""
+        regions = []
+        for key in list(tbls.keys()):
+            items = tbls[key]
+            for item in items:
+                if isinstance(item, dict) and item.get("page_number") == page:
+                    regions.append({
+                        "x0": item.get("x0", 0),
+                        "x1": item.get("x1", 0),
+                        "top": item.get("top", 0),
+                        "bottom": item.get("bottom", 0),
+                    })
+        return regions
+
+    @staticmethod
+    def _bbox_overlap_ratio(a, b):
+        """计算两个 bbox 的 IoU（交并比）。"""
+        x_overlap = max(0, min(a["x1"], b["x1"]) - max(a["x0"], b["x0"]))
+        y_overlap = max(0, min(a["bottom"], b["bottom"]) - max(a["top"], b["top"]))
+        inter = x_overlap * y_overlap
+        if inter <= 0:
+            return 0.0
+        area_a = (a["x1"] - a["x0"]) * (a["bottom"] - a["top"])
+        area_b = (b["x1"] - b["x0"]) * (b["bottom"] - b["top"])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def _try_docutable_extract_into_boxes(self, fnm, zoomin=3):
+        """在 _parse_loaded_window_into_bboxes 中补充 docutable 表格到 self.boxes。
+
+        与 _try_docutable_extract 不同，这个方法直接操作 self.boxes，
+        用于 parse_into_bboxes 生产路径。仅在非 chunk 模式下被调用。
+        """
+        if not self._docutable_enabled():
+            return
+
+        pdf_input, temp_path = self._docutable_prepare_input(fnm)
+        if pdf_input is None:
+            return
+
+        try:
+            ext = DocuTableExtractor(check_keywords=False)
+            results = ext.extract(pdf_input)
+            logging.info("docutable: raw extract returned %d result(s)", len(results))
+
+            added = 0
+            skipped_dup = 0
+            existing_tables = [b for b in self.boxes if b.get("layout_type") == "table"]
+
+            for r in results:
+                tbl_data = r.get("data", [])
+                if not tbl_data:
+                    continue
+
+                # docutable 返回 1-based 全局页码，转换为 0-based chunk 内索引
+                page = r.get("page", 1)
+                local_page_idx = page - 1 - self.page_from
+                if local_page_idx < 0 or local_page_idx >= len(self.page_images):
+                    continue
+
+                lx0, ltop, lx1, lbot = self._parse_result_bbox(r)
+
+                # 按 bbox 与已有表格去重（仅当有真实 bbox 时）
+                bbox = r.get("bbox")
+                if bbox and len(bbox) == 4:
+                    cand = {"x0": bbox[0], "x1": bbox[2], "top": bbox[1], "bottom": bbox[3]}
+                    if any(
+                        self._bbox_overlap_ratio(cand, e) > 0.5
+                        for e in existing_tables
+                        if e.get("page_number") == page
+                    ):
+                        skipped_dup += 1
+                        continue
+
+                # 页内局部坐标 → 累积坐标（与 insert_table_figures 一致）
+                cum_top = self.page_cum_height[local_page_idx]
+                tbl_text = self._build_table_text(tbl_data)
+
+                # 裁剪表格图片（与 insert_table_figures 的输出格式一致）
+                try:
+                    img = self.page_images[local_page_idx].crop(
+                        (lx0 * zoomin, ltop * zoomin, lx1 * zoomin, lbot * zoomin)
+                    )
+                except Exception:
+                    img = None
+
+                self.boxes.append({
+                    "page_number": page,
+                    "x0": lx0, "x1": lx1,
+                    "top": ltop + cum_top, "bottom": lbot + cum_top,
+                    "layout_type": "table",
+                    "text": tbl_text,
+                    "image": img,
+                    "positions": [[page, int(lx0), int(lx1), int(ltop), int(lbot)]],
+                    "source": f"docutable/{r.get('extractor', 'docutable')}",
+                })
+                added += 1
+
+            if added:
+                logging.info("docutable: added %d table(s) (skipped %d dup)", added, skipped_dup)
+            elif skipped_dup:
+                logging.info("docutable: all %d table(s) are duplicates", skipped_dup)
+            else:
+                logging.warning("docutable: 0 tables added from %d results", len(results))
+        except Exception:
+            logging.warning("docutable extraction FAILED", exc_info=True)
+        finally:
+            self._docutable_cleanup_temp(temp_path)
+
+    def _try_docutable_extract(self, fnm, tbls):
+        """在 __call__ 路径末尾补充 docutable 表格到 tbls 字典。
+
+        由 Pdf.__call__() 在 layout 流程收尾时调用。
+        fnm 可以是本地文件路径(str)或文件内容(bytes)。
+        """
+        if not self._docutable_enabled():
+            return
+
+        pdf_input, temp_path = self._docutable_prepare_input(fnm)
+        if pdf_input is None:
+            return
+
+        try:
+            ext = DocuTableExtractor(check_keywords=False)
+            results = ext.extract(pdf_input)
+            logging.info(
+                "docutable: extracted %d result(s) from %s",
+                len(results), os.path.basename(pdf_input),
+            )
+
+            added = 0
+            skipped_dup = 0
+            for r in results:
+                tbl_data = r.get("data", [])
+                if not tbl_data:
+                    continue
+
+                page = r.get("page", 1)
+                extractor = r.get("extractor", "docutable")
+
+                # 按 bbox 去重：与已有表格对比
+                bbox = r.get("bbox")
+                if bbox and len(bbox) == 4:
+                    cand_region = {
+                        "x0": bbox[0], "x1": bbox[2],
+                        "top": bbox[1], "bottom": bbox[3],
+                    }
+                    existing = self._tbls_existing_regions(tbls, page)
+                    if any(
+                        self._bbox_overlap_ratio(cand_region, e) > 0.5
+                        for e in existing
+                    ):
+                        skipped_dup += 1
+                        continue
+
+                x0, top, x1, bottom = self._parse_result_bbox(r)
+                tbl_text = self._build_table_text(tbl_data)
+
+                key = f"docutable-{page}-{added}"
+                b = {
+                    "page_number": page,
+                    "x0": x0, "x1": x1,
+                    "top": top, "bottom": bottom,
+                    "text": tbl_text,
+                    "layout_type": "table",
+                    "layoutno": key,
+                    "source": f"docutable/{extractor}",
+                }
+                if key not in tbls:
+                    tbls[key] = []
+                tbls[key].append(b)
+                added += 1
+
+            if added:
+                msg = f"docutable: extracted {added} supplementary table(s) from {os.path.basename(pdf_input)}"
+                if skipped_dup:
+                    msg += f" ({skipped_dup} skipped as duplicates)"
+                logging.info(msg)
+            elif skipped_dup:
+                logging.info(
+                    "docutable: all %d extracted table(s) from %s are duplicates, skipped",
+                    skipped_dup,
+                    os.path.basename(pdf_input),
+                )
+            else:
+                logging.info(
+                    "docutable: 0 tables from %d result(s) in %s",
+                    len(results), os.path.basename(pdf_input),
+                )
+        except Exception:
+            logging.warning("docutable extraction FAILED", exc_info=True)
+        finally:
+            self._docutable_cleanup_temp(temp_path)
+
 
 class PlainParser:
     def __call__(self, filename, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, **kwargs):
@@ -2082,7 +2364,9 @@ class VisionParser(RAGFlowPdfParser):
             if text:
                 width, height = self.page_images[idx].size
                 all_docs.append((text, f"@@{pdf_page_num + 1}\t{0.0:.1f}\t{width / zoomin:.1f}\t{0.0:.1f}\t{height / zoomin:.1f}##"))
-        return all_docs, []
+        tbls = {}
+        self._try_docutable_extract(filename, tbls)
+        return all_docs, tbls
 
 
 if __name__ == "__main__":

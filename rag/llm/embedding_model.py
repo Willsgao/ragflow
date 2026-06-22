@@ -43,6 +43,35 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_TOKENS = 8192
 
 
+def _force_urllib3_tls12():
+    """Monkey-patch urllib3's SSL context factory to force TLS 1.2.
+
+    Python 3.13 + OpenSSL 3.5+ produces SSLEOFError when negotiating TLS 1.3
+    with certain servers (e.g. siliconflow.cn).  Patching at the urllib3 level
+    (which is shared by *all* ``requests`` sessions and ``httpx`` clients that
+    go through urllib3) is the only reliable fix — per-session adapters can be
+    bypassed by connection-pool reuse.
+    """
+    import ssl
+    try:
+        from urllib3.util import ssl_ as _urllib3_ssl
+    except ImportError:
+        return  # urllib3 too old, nothing to patch
+
+    _orig_create = _urllib3_ssl.create_urllib3_context
+
+    def _create_tls12(*args, **kwargs):
+        ctx = _orig_create(*args, **kwargs)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        return ctx
+
+    _urllib3_ssl.create_urllib3_context = _create_tls12
+
+
+_force_urllib3_tls12()
+
+
 class EmbeddingError(ModelException):
     """Raised when an embedding provider fails to return usable embeddings.
 
@@ -247,13 +276,30 @@ class BuiltinEmbed(Base):
         return self._model.encode_queries(text)
 
 
+def _openai_client(key, base_url):
+    """Create an OpenAI client with TLS 1.2 forced.
+
+    Python 3.13 + OpenSSL 3.5+ can produce SSLEOFError on some API servers.
+    Forcing TLS 1.2 (same workaround as _make_session in CommonAPITextEmbed)
+    avoids the handshake failure.
+    """
+    import ssl
+    import httpx
+
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    http_client = httpx.Client(verify=ctx)
+    return OpenAI(api_key=key, base_url=base_url, http_client=http_client)
+
+
 class OpenAIEmbed(Base):
     _FACTORY_NAME = "OpenAI"
 
     def __init__(self, key, model_name="text-embedding-ada-002", base_url="https://api.openai.com/v1"):
         if not base_url:
             base_url = "https://api.openai.com/v1"
-        self.client = OpenAI(api_key=key, base_url=base_url)
+        self.client = _openai_client(key, base_url)
         self.model_name = model_name
 
     def _call(self, batch):
@@ -276,7 +322,7 @@ class LocalAIEmbed(Base):
         if not base_url:
             raise ValueError("Local embedding model url cannot be None")
         base_url = urljoin(base_url, "v1")
-        self.client = OpenAI(api_key="empty", base_url=base_url)
+        self.client = _openai_client("empty", base_url)
         self.model_name = model_name.split("___")[0]
 
     def _call(self, batch):
@@ -499,7 +545,7 @@ class XinferenceEmbed(Base):
 
     def __init__(self, key, model_name="", base_url=""):
         base_url = urljoin(base_url, "v1")
-        self.client = OpenAI(api_key=key, base_url=base_url)
+        self.client = _openai_client(key, base_url)
         self.model_name = model_name
 
     def _call(self, batch):
@@ -841,7 +887,7 @@ class LmStudioEmbed(LocalAIEmbed):
         if not base_url:
             raise ValueError("Local llm url cannot be None")
         base_url = urljoin(base_url, "v1")
-        self.client = OpenAI(api_key="lm-studio", base_url=base_url)
+        self.client = _openai_client("lm-studio", base_url)
         self.model_name = model_name
 
 
@@ -852,7 +898,7 @@ class OpenAI_APIEmbed(OpenAIEmbed):
         if not base_url:
             raise ValueError("url cannot be None")
         base_url = urljoin(base_url, "v1")
-        self.client = OpenAI(api_key=key, base_url=base_url)
+        self.client = _openai_client(key, base_url)
         self.model_name = model_name.split("___")[0]
 
 
@@ -936,6 +982,15 @@ class SILICONFLOWEmbed(Base):
         }
         self.base_url = normalized_base_url
         self.model_name = model_name
+        self._session = self._make_session()
+
+    @staticmethod
+    def _make_session():
+        """Create a requests Session."""
+        # SSL context forcing is handled once at module level via
+        # _force_urllib3_tls12(), so we just return a plain session.
+        import requests
+        return requests.Session()
 
     def _clean_batch(self, batch):
         if self.model_name in ["BAAI/bge-large-zh-v1.5", "BAAI/bge-large-en-v1.5"]:
@@ -944,13 +999,25 @@ class SILICONFLOWEmbed(Base):
         return [" " if not text.strip() else text for text in batch]
 
     def _call(self, batch):
+        import time
+        import random
+        import requests as _requests
         payload = {
             "model": self.model_name,
             "input": self._clean_batch(batch),
             "encoding_format": "float",
         }
-        response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=30)
-        return self._openai_http_embeddings(response)
+        last_err = None
+        for attempt in range(5):
+            try:
+                # Recreate session on retry to avoid stale SSL state
+                session = self._session if attempt == 0 else self._make_session()
+                response = session.post(self.base_url, json=payload, headers=self.headers, timeout=30)
+                return self._openai_http_embeddings(response)
+            except _requests.exceptions.SSLError as e:
+                last_err = e
+                time.sleep((2 ** attempt) + random.random())
+        raise last_err
 
     def encode(self, texts: list):
         return self._batched_encode(texts, self._call, batch_size=16)
@@ -1145,7 +1212,7 @@ class GPUStackEmbed(OpenAIEmbed):
             raise ValueError("url cannot be None")
         base_url = urljoin(base_url, "v1")
 
-        self.client = OpenAI(api_key=key, base_url=base_url)
+        self.client = _openai_client(key, base_url)
         self.model_name = model_name
 
 

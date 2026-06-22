@@ -58,11 +58,31 @@ class LayoutRecognizer(Recognizer):
             logging.info(f"LayoutRecognizer using remote DLA client at {dla_url} (via {env_used})")
             return
 
+        model_dir = os.path.join(get_project_base_directory(), "rag/res/deepdoc")
+        target = os.path.join(model_dir, domain + ".onnx")
+
+        # Fallback: if the exact model file is missing (e.g. "layout.onnx" not downloaded),
+        # try to use an available variant (same architecture, different training domain).
+        if not os.path.exists(target):
+            import glob
+            candidates = glob.glob(os.path.join(model_dir, domain + ".*.onnx"))
+            if candidates:
+                import shutil
+                shutil.copyfile(candidates[0], target)
+
         try:
-            model_dir = os.path.join(get_project_base_directory(), "rag/res/deepdoc")
             super().__init__(self.labels, domain, model_dir)
         except Exception:
-            model_dir = snapshot_download(repo_id="InfiniFlow/deepdoc", local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"), local_dir_use_symlinks=False)
+            model_dir = snapshot_download(repo_id="InfiniFlow/deepdoc",
+                                          local_dir=model_dir,
+                                          local_dir_use_symlinks=False)
+            target = os.path.join(model_dir, domain + ".onnx")
+            if not os.path.exists(target):
+                import glob
+                candidates = glob.glob(os.path.join(model_dir, domain + ".*.onnx"))
+                if candidates:
+                    import shutil
+                    shutil.copyfile(candidates[0], target)
             super().__init__(self.labels, domain, model_dir)
 
     def __call__(self, image_list, ocr_res, scale_factor=3, thr=0.2, batch_size=16, drop=True):

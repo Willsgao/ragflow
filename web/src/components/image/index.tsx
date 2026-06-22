@@ -1,7 +1,4 @@
-import { Authorization } from '@/constants/authorization';
 import { restAPIv1 } from '@/utils/api';
-import { getAuthorization } from '@/utils/authorization-util';
-import { getSearchValue } from '@/utils/common-util';
 import classNames from 'classnames';
 import React, { useEffect, useMemo, useState } from 'react';
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
@@ -32,13 +29,12 @@ export const buildDocumentImageUrl = (id: string, t?: string | number) => {
   return `${restAPIv1}/documents/images/${id}${query ? `?${query}` : ''}`;
 };
 
-const fetchDocumentImage = (url: string, authorization: string) => {
-  const cacheKey = `${authorization}:${url}`;
-  let item = imageCache.get(cacheKey);
+const fetchDocumentImage = (url: string) => {
+  let item = imageCache.get(url);
 
   if (!item) {
     item = { count: 0 };
-    imageCache.set(cacheKey, item);
+    imageCache.set(url, item);
   }
   if (item.timer) {
     clearTimeout(item.timer);
@@ -47,7 +43,7 @@ const fetchDocumentImage = (url: string, authorization: string) => {
   item.count += 1;
 
   if (!item.promise) {
-    item.promise = fetch(url, { headers: { [Authorization]: authorization } })
+    item.promise = fetch(url)
       .then((response) => {
         if (!response.ok) {
           throw new Error(response.statusText);
@@ -59,7 +55,7 @@ const fetchDocumentImage = (url: string, authorization: string) => {
         return item.objectUrl;
       })
       .catch((error) => {
-        imageCache.delete(cacheKey);
+        imageCache.delete(url);
         throw error;
       });
   }
@@ -74,7 +70,7 @@ const fetchDocumentImage = (url: string, authorization: string) => {
             if (item.objectUrl) {
               URL.revokeObjectURL(item.objectUrl);
             }
-            imageCache.delete(cacheKey);
+            imageCache.delete(url);
           }
         }, 30000);
       }
@@ -84,20 +80,12 @@ const fetchDocumentImage = (url: string, authorization: string) => {
 
 export const useDocumentImageUrl = (id: string, t?: string | number) => {
   const directUrl = useMemo(() => buildDocumentImageUrl(id, t), [id, t]);
-  const [imageUrl, setImageUrl] = useState(() =>
-    getAuthorization() && getSearchValue('shared_id') ? '' : directUrl,
-  );
+  const [imageUrl, setImageUrl] = useState('');
 
   useEffect(() => {
-    const authorization = getAuthorization();
-    if (!authorization || !getSearchValue('shared_id')) {
-      setImageUrl(directUrl);
-      return;
-    }
-
     let ignore = false;
-    setImageUrl('');
-    const { promise, release } = fetchDocumentImage(directUrl, authorization);
+    const { promise, release } = fetchDocumentImage(directUrl);
+
     promise
       .then((url) => {
         if (ignore) {
