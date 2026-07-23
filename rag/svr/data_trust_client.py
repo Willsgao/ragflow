@@ -94,6 +94,36 @@ class SubmitBatchResult:
     chunk_count: int
 
 
+@dataclass
+class ReviewBatchSummary:
+    batch_id: str
+    tenant_id: str
+    doc_id: str
+    kb_id: str
+    status: str
+    chunk_count: int
+    completed_at: str = ""
+
+
+@dataclass
+class ChunkDecision:
+    id: str
+    action: str  # approved / approved_with_changes / rejected
+    corrected_content: str | None = None
+    changes: list[dict] | None = None
+    reason: str | None = None
+
+
+@dataclass
+class BatchResult:
+    batch_id: str
+    tenant_id: str
+    kb_id: str
+    doc_id: str
+    status: str
+    chunks: list[ChunkDecision] = field(default_factory=list)
+
+
 # ── Circuit breaker ──────────────────────────────────────────────────────────
 
 class CircuitBreaker:
@@ -263,6 +293,53 @@ class DataTrustClient:
             status=data["status"],
             chunk_count=data["chunk_count"],
         )
+
+    async def list_completed_batches(self, kb_id: str = "") -> list[ReviewBatchSummary]:
+        """§9.2: List batches that have completed review (status=completed)."""
+        path = "/review-batches?status=completed"
+        if kb_id:
+            path += f"&kb_id={kb_id}"
+        data = await self._request("GET", path)
+        items = data if isinstance(data, list) else data.get("batches", [])
+        return [
+            ReviewBatchSummary(
+                batch_id=item["batch_id"],
+                tenant_id=item["tenant_id"],
+                doc_id=item["doc_id"],
+                kb_id=item["kb_id"],
+                status=item["status"],
+                chunk_count=item.get("chunk_count", 0),
+                completed_at=item.get("completed_at", ""),
+            )
+            for item in items
+        ]
+
+    async def get_batch_result(self, batch_id: str) -> BatchResult:
+        """§9.3: Fetch the per-chunk review decisions for a completed batch."""
+        data = await self._request("GET", f"/review-batches/{batch_id}/result")
+        chunks = [
+            ChunkDecision(
+                id=c["id"],
+                action=c["action"],
+                corrected_content=c.get("corrected_content"),
+                changes=c.get("changes"),
+                reason=c.get("reason"),
+            )
+            for c in data.get("chunks", [])
+        ]
+        return BatchResult(
+            batch_id=data["batch_id"],
+            tenant_id=data["tenant_id"],
+            kb_id=data["kb_id"],
+            doc_id=data["doc_id"],
+            status=data["status"],
+            chunks=chunks,
+        )
+
+    async def mark_batch_applied(self, batch_id: str) -> bool:
+        """§9.4: Mark a batch as applied after chunk updates are committed."""
+        data = await self._request("PATCH", f"/review-batches/{batch_id}", json={"status": "applied"})
+        return data.get("status") == "applied"
 
 
 # ── Module-level singleton ───────────────────────────────────────────────────
