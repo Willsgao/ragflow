@@ -1,0 +1,35 @@
+# -----------------------------------------------------------------------------
+# Dev override — injects local source code into the RAGFlow container.
+# Docker Compose automatically merges this file with docker-compose.yml.
+#
+# To run the ORIGINAL (unmodified) version, simply delete or rename this file,
+# then restart:
+#   cd docker
+#   docker compose --profile cpu down
+#   docker compose --profile cpu up -d
+#
+# To run your DEV version, keep this file in place. After changing any Python
+# code under deepdoc/, just restart the container:
+#   docker compose restart ragflow-cpu
+# -----------------------------------------------------------------------------
+
+services:
+  ragflow-cpu:
+    volumes:
+      - ../deepdoc:/ragflow/deepdoc
+      - ../api:/ragflow/api
+      - ../rag:/ragflow/rag
+      - ../agent:/ragflow/agent
+      - ../common:/ragflow/common
+      - ../conf:/ragflow/conf
+      - ../admin:/ragflow/admin
+
+  ragflow-gpu:
+    volumes:
+      - ../deepdoc:/ragflow/deepdoc
+      - ../api:/ragflow/api
+      - ../rag:/ragflow/rag
+      - ../agent:/ragflow/agent
+      - ../common:/ragflow/common
+      - ../conf:/ragflow/conf
+      - ../admin:/ragflow/admin
