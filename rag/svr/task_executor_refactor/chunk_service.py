@@ -26,6 +26,7 @@ This module orchestrates the chunk building pipeline by delegating to:
 
 import asyncio
 import copy
+import hashlib
 import logging
 from datetime import datetime
 from functools import partial
@@ -44,6 +45,14 @@ from rag.utils.base64_image import image2id
 
 from api.db.services.task_service import TaskService
 from rag.svr.task_executor_refactor.constants import GRAPH_RAPTOR_FAKE_DOC_ID
+from rag.svr.data_trust_client import (
+    ChunkPayload,
+    CircuitBreakerOpenError,
+    DataTrustRequestError,
+    SubmitBatchPayload,
+    get_client,
+)
+from rag.svr.review_outbox import get_outbox
 
 # Re-export for backward compatibility
 from rag.svr.task_executor_refactor.chunk_builder import (
@@ -273,8 +282,119 @@ class ChunkService:
         if not await self._insert_mother_chunks(task_id, task_tenant_id, task_dataset_id, mothers, doc_bulk_size):
             return False
 
-        # Insert main chunks
-        return await self._insert_main_chunks(task_id, task_tenant_id, task_dataset_id, chunks, doc_bulk_size)
+        # ── Review gate: split into auto_pass / pending ─────────────────
+        auto_pass, pending = await self._gate_review(chunks, task_tenant_id, task_dataset_id)
+
+        # Mark pending chunks unavailable (will become retrievable after review approval)
+        for ck in pending:
+            ck["available_int"] = 0
+
+        # Insert all main chunks (pending go to ES with available_int=0)
+        if not await self._insert_main_chunks(task_id, task_tenant_id, task_dataset_id, chunks, doc_bulk_size):
+            return False
+
+        # Submit pending batch to DataTrust (or outbox on failure)
+        if pending:
+            doc_id = getattr(self._task_context, "doc_id", "") or (
+                chunks[0].get("doc_id", "") if chunks else ""
+            )
+            await self._submit_review_batch(pending, task_tenant_id, task_dataset_id, doc_id)
+
+        return True
+
+    # ── Review gate helpers ──────────────────────────────────────────────
+
+    async def _gate_review(
+        self, chunks: List[Dict[str, Any]], tenant_id: str, kb_id: str
+    ) -> tuple[list, list]:
+        """Evaluate the DataTrust review policy and split *chunks* into
+        ``(auto_pass, pending)``.  Returns ``(all, [])`` when gating is
+        disabled or skipped."""
+        client = get_client()
+        if not client.configured:
+            return chunks, []
+
+        try:
+            policy = await client.get_review_policy(kb_id)
+        except (CircuitBreakerOpenError, DataTrustRequestError):
+            # Circuit open (fail_closed) or network unreachable → all pending
+            logger.warning("DataTrust unreachable (fail_closed): %d chunks pending review", len(chunks))
+            return [], chunks
+
+        mode = policy.mode if hasattr(policy, "mode") else policy.get("mode", "auto_pass")
+
+        if mode == "auto_pass":
+            return chunks, []
+        if mode == "full_review":
+            return [], chunks
+        if mode == "sampled":
+            rate = policy.sample_rate if hasattr(policy, "sample_rate") else policy.get("sample_rate", 1.0)
+            auto_pass, pending = [], []
+            for ck in chunks:
+                target = pending if self._deterministic_sample(ck["id"], rate) else auto_pass
+                target.append(ck)
+            logger.info(
+                "Sampled review: %d/%d chunks pending (rate=%.2f)",
+                len(pending), len(chunks), rate,
+            )
+            return auto_pass, pending
+
+        # Unknown mode → treat as auto_pass
+        return chunks, []
+
+    async def _submit_review_batch(
+        self,
+        pending: List[Dict[str, Any]],
+        tenant_id: str,
+        kb_id: str,
+        doc_id: str,
+    ) -> None:
+        """Submit a review batch to DataTrust; fall back to the outbox on failure."""
+        if self._task_context.write_interceptor:
+            logger.debug("Dry-run mode: skipping DataTrust submission (%d chunks)", len(pending))
+            return
+
+        client = get_client()
+        payload_obj = SubmitBatchPayload(
+            tenant_id=tenant_id,
+            doc_id=doc_id,
+            kb_id=kb_id,
+            object_type="text_chunk",
+            chunks=[
+                ChunkPayload(id=ck.get("id", ""), content_with_weight=ck.get("content_with_weight", ""))
+                for ck in pending
+            ],
+        )
+
+        try:
+            result = await client.submit_review_batch(payload_obj)
+            logger.info(
+                "Review batch submitted: batch_id=%s chunks=%d", result.batch_id, result.chunk_count,
+            )
+        except (CircuitBreakerOpenError, DataTrustRequestError) as e:
+            logger.warning("DataTrust submit failed (%s), enqueueing %d chunks to outbox", e, len(pending))
+            outbox_payload = {
+                "tenant_id": tenant_id,
+                "doc_id": doc_id,
+                "kb_id": kb_id,
+                "object_type": "text_chunk",
+                "tasks": [
+                    {"chunk_id": ck.get("id", ""), "content_with_weight": ck.get("content_with_weight", "")}
+                    for ck in pending
+                ],
+            }
+            get_outbox().enqueue(outbox_payload)
+
+    @staticmethod
+    def _deterministic_sample(chunk_id: str, sample_rate: float) -> bool:
+        """Hash-based deterministic sampling so the same *chunk_id* always
+        maps to the same result for a given *sample_rate*."""
+        if sample_rate >= 1.0:
+            return True
+        if sample_rate <= 0.0:
+            return False
+        h = int(hashlib.md5(chunk_id.encode()).hexdigest(), 16)
+        return (h % 10000) / 10000.0 < sample_rate
 
     @classmethod
     def _create_mother_chunks(cls, chunks: List[Dict]) -> List[Dict]:
