@@ -14,6 +14,8 @@ import asyncio
 import json
 import logging
 import os
+import time
+from collections import OrderedDict
 from typing import Any
 
 from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type
@@ -25,6 +27,7 @@ from rag.nlp import rag_tokenizer
 from rag.nlp.search import index_name
 from rag.svr.data_trust_client import (
     ChunkDecision,
+    CircuitBreaker,
     CircuitBreakerOpenError,
     DataTrustRequestError,
     ReviewBatchSummary,
@@ -40,34 +43,86 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL: float = float(os.environ.get("REVIEW_WORKER_POLL_INTERVAL", "30"))
 OUTBOX_BATCH: int = int(os.environ.get("REVIEW_WORKER_OUTBOX_BATCH", "50"))
+EMBED_CACHE_MAX: int = int(os.environ.get("REVIEW_WORKER_EMBED_CACHE_MAX", "64"))
 
 
 class ReviewResultWorker:
     """Poll DataTrust for completed review batches and apply chunk decisions."""
 
+    # ── Health counters (public for introspection) ────────────────────────
+
+    approved_total: int = 0
+    corrected_total: int = 0
+    rejected_total: int = 0
+    batch_applied_total: int = 0
+    batch_failed_total: int = 0
+    outbox_replayed_total: int = 0
+    outbox_failed_total: int = 0
+    last_poll_ts: float = 0.0
+    poll_error_count: int = 0
+
     def __init__(self, poll_interval: float = POLL_INTERVAL):
         self.poll_interval = poll_interval
         self._client = get_client()
         self._outbox = get_outbox()
-        self._shutdown = False
-        # Cache embedding models per tenant_id
-        self._embed_cache: dict[str, LLMBundle] = {}
+        self._shutdown_event = asyncio.Event()
+        # LRU cache for embedding models (tenant_id → LLMBundle), capped at EMBED_CACHE_MAX
+        self._embed_cache: OrderedDict[str, LLMBundle] = OrderedDict()
+
+    @property
+    def is_shutdown(self) -> bool:
+        return self._shutdown_event.is_set()
+
+    @property
+    def health(self) -> dict[str, Any]:
+        """Return a snapshot of worker health counters."""
+        return {
+            "approved_total": self.approved_total,
+            "corrected_total": self.corrected_total,
+            "rejected_total": self.rejected_total,
+            "batch_applied_total": self.batch_applied_total,
+            "batch_failed_total": self.batch_failed_total,
+            "outbox_replayed_total": self.outbox_replayed_total,
+            "outbox_failed_total": self.outbox_failed_total,
+            "last_poll_ts": self.last_poll_ts,
+            "poll_error_count": self.poll_error_count,
+            "embed_cache_size": len(self._embed_cache),
+            "shutdown": self.is_shutdown,
+        }
 
     # ── Main loop ─────────────────────────────────────────────────────────
 
     async def run(self) -> None:
         """Run the worker loop until shutdown."""
-        logger.info("ReviewResultWorker started (poll_interval=%.1fs)", self.poll_interval)
-        while not self._shutdown:
+        logger.info(
+            "ReviewResultWorker started (poll_interval=%.1fs, embed_cache_max=%d, outbox_batch=%d)",
+            self.poll_interval,
+            EMBED_CACHE_MAX,
+            OUTBOX_BATCH,
+        )
+        while not self._shutdown_event.is_set():
             try:
                 await self._duty_a_poll_results()
                 await self._duty_b_replay_outbox()
+                self.last_poll_ts = time.time()
             except Exception:
                 logger.exception("Worker loop error — will retry after interval")
-            await asyncio.sleep(self.poll_interval)
+                self.poll_error_count += 1
+            # Sleep in small chunks so shutdown responds quickly
+            await self._sleep_interruptible(self.poll_interval)
+
+    async def _sleep_interruptible(self, seconds: float, granularity: float = 1.0) -> None:
+        """Sleep up to *seconds* in *granularity*-second steps, respecting shutdown."""
+        remaining = seconds
+        while remaining > 0 and not self._shutdown_event.is_set():
+            step = min(granularity, remaining)
+            await asyncio.sleep(step)
+            remaining -= step
 
     def shutdown(self) -> None:
-        self._shutdown = True
+        """Signal the worker to stop at the next opportunity."""
+        logger.info("ReviewResultWorker shutdown requested (pending=%s)", self._shutdown_event.is_set())
+        self._shutdown_event.set()
 
     # ── Duty A: Poll + apply review results ───────────────────────────────
 
@@ -76,9 +131,14 @@ class ReviewResultWorker:
         if not self._client.configured:
             return
 
+        # Skip poll when circuit breaker is open (will retry once it closes)
+        if self._client.circuit.state == CircuitBreaker.STATE_OPEN:
+            return
+
         try:
             batches = await self._client.list_completed_batches()
         except (CircuitBreakerOpenError, DataTrustRequestError):
+            self.poll_error_count += 1
             return
 
         if not batches:
@@ -90,6 +150,7 @@ class ReviewResultWorker:
             try:
                 await self._apply_single_batch(batch)
             except Exception:
+                self.batch_failed_total += 1
                 logger.exception("Failed to apply batch %s", batch.batch_id)
 
     async def _apply_single_batch(self, batch: ReviewBatchSummary) -> None:
@@ -118,6 +179,7 @@ class ReviewResultWorker:
                 settings.docStoreConn.update(
                     {"id": chunk.id}, {"available_int": 1}, idx, kb_id,
                 )
+                self.approved_total += 1
             except Exception:
                 logger.exception("Failed to activate chunk %s", chunk.id)
 
@@ -127,6 +189,7 @@ class ReviewResultWorker:
             for chunk in corrected:
                 try:
                     await self._apply_corrected_chunk(chunk, tenant_id, kb_id, idx, embed_model)
+                    self.corrected_total += 1
                 except Exception:
                     logger.exception("Failed to apply corrected chunk %s", chunk.id)
 
@@ -137,10 +200,12 @@ class ReviewResultWorker:
                 chunk.id,
                 f": {chunk.reason}" if chunk.reason else "",
             )
+            self.rejected_total += 1
 
         # 5. Mark batch as applied
         try:
             await self._client.mark_batch_applied(batch_id)
+            self.batch_applied_total += 1
             logger.info(
                 "Batch %s applied: approved=%d corrected=%d rejected=%d",
                 batch_id, len(approved), len(corrected), len(rejected),
@@ -148,22 +213,33 @@ class ReviewResultWorker:
         except (CircuitBreakerOpenError, DataTrustRequestError) as e:
             logger.warning("Cannot mark batch %s applied: %s — retry next poll", batch_id, e)
 
-    # ── Embedding model cache ─────────────────────────────────────────────
+    # ── Embedding model cache (LRU, capped at EMBED_CACHE_MAX) ───────────
 
     async def _get_or_create_embed_model(self, tenant_id: str) -> LLMBundle | None:
-        """Return a cached embedding model for *tenant_id*, creating if needed."""
+        """Return a cached embedding model for *tenant_id*, creating if needed.
+        Use LRU eviction: when the cache exceeds EMBED_CACHE_MAX the oldest entry is dropped.
+        """
         if tenant_id in self._embed_cache:
+            # Touch — move to end (most-recently-used)
+            self._embed_cache.move_to_end(tenant_id)
             return self._embed_cache[tenant_id]
 
         try:
             cfg = get_tenant_default_model_by_type(tenant_id, LLMType.EMBEDDING)
             model = await thread_pool_exec(LLMBundle, tenant_id, cfg, "English")
-            self._embed_cache[tenant_id] = model
-            logger.info("Embedding model bound for tenant %s", tenant_id)
-            return model
         except Exception:
             logger.exception("Cannot bind embedding model for tenant %s", tenant_id)
             return None
+
+        # Evict oldest if at capacity
+        while len(self._embed_cache) >= EMBED_CACHE_MAX:
+            evicted = self._embed_cache.popitem(last=False)
+            logger.debug("Embed cache evicted tenant %s (cap=%d)", evicted[0], EMBED_CACHE_MAX)
+
+        self._embed_cache[tenant_id] = model
+        logger.info("Embedding model bound for tenant %s (cache %d/%d)",
+                     tenant_id, len(self._embed_cache), EMBED_CACHE_MAX)
+        return model
 
     # ── Corrected chunk helpers ───────────────────────────────────────────
 
@@ -207,8 +283,14 @@ class ReviewResultWorker:
     # ── Duty B: Outbox replay ─────────────────────────────────────────────
 
     async def _duty_b_replay_outbox(self) -> None:
-        """Replay pending outbox records (exponential-backoff retry)."""
+        """Replay pending outbox records (exponential-backoff retry).
+        Skips replay entirely when the circuit breaker is open to avoid cascading failures.
+        """
         if not self._client.configured:
+            return
+
+        # Don't hammer DataTrust when the circuit is open
+        if self._client.circuit.state == CircuitBreaker.STATE_OPEN:
             return
 
         pending = self._outbox.peek_pending(OUTBOX_BATCH)
@@ -239,10 +321,15 @@ class ReviewResultWorker:
             try:
                 r = await self._client.submit_review_batch(submit)
                 self._outbox.mark_submitted(rec_id)
+                self.outbox_replayed_total += 1
                 logger.info("Outbox %d replayed → batch %s", rec_id, r.batch_id)
             except (CircuitBreakerOpenError, DataTrustRequestError) as e:
                 self._outbox.mark_failed(rec_id)
+                self.outbox_failed_total += 1
                 logger.warning("Outbox %d replay failed: %s", rec_id, e)
+                # If circuit just opened, stop replaying further items this cycle
+                if isinstance(e, CircuitBreakerOpenError):
+                    break
 
 
 # ── Singleton & entry point ──────────────────────────────────────────────────

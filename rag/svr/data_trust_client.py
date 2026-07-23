@@ -226,7 +226,7 @@ class DataTrustClient:
                 method,
                 url,
                 request_timeout=self.timeout,
-                retries=0,  # we handle retries via the circuit breaker themselves
+                retries=0,  # retries are handled by the circuit breaker itself
                 **kwargs,
             )
             if response.status_code >= 400:

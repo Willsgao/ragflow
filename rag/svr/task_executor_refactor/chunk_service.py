@@ -321,14 +321,14 @@ class ChunkService:
             logger.warning("DataTrust unreachable (fail_closed): %d chunks pending review", len(chunks))
             return [], chunks
 
-        mode = policy.mode if hasattr(policy, "mode") else policy.get("mode", "auto_pass")
+        mode = policy.mode
 
         if mode == "auto_pass":
             return chunks, []
         if mode == "full_review":
             return [], chunks
         if mode == "sampled":
-            rate = policy.sample_rate if hasattr(policy, "sample_rate") else policy.get("sample_rate", 1.0)
+            rate = policy.sample_rate
             auto_pass, pending = [], []
             for ck in chunks:
                 target = pending if self._deterministic_sample(ck["id"], rate) else auto_pass
